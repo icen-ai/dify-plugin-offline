@@ -273,6 +273,17 @@ PY
 		echo "Prerelease versions: disallowed"
 	fi
 
+	# Keep uv's resolution Python version aligned with pip download's target.
+	# Otherwise uv may pin transitive versions whose target-Python wheels do
+	# not exist (e.g. gevent==25.5.1 for cp313 only), and pip download fails
+	# or — worse — silently produces an incomplete ./wheels/ for Dify.
+	if [[ -n "$PIP_TARGET_PY_VERSION" && "$UV_PLATFORM" == "linux" ]]; then
+		if [[ "$UV_PY_VERSION" != "$PIP_TARGET_PY_VERSION" ]]; then
+			echo "ℹ Aligning uv resolution python ($UV_PY_VERSION → $PIP_TARGET_PY_VERSION) with target"
+			UV_PY_VERSION="$PIP_TARGET_PY_VERSION"
+		fi
+	fi
+
 	echo "✓ Configuration: platform=${UV_PLATFORM:-current}, python=$UV_PY_VERSION"
 
 	# ============================================
@@ -336,8 +347,27 @@ PYSTRIP
 		echo "✓ Dev dependency groups removed"
 	fi
 
-	if [ -f "pyproject.toml" ] && [ ! -f "requirements.txt" ]; then
+	# IMPORTANT: We must ALWAYS regenerate requirements.txt from pyproject.toml
+	# when pyproject.toml is present, even if the plugin shipped a
+	# requirements.txt of its own. Marketplace plugins (e.g.
+	# langgenius/openai_api_compatible) ship a requirements.txt that lists
+	# only top-level deps (dify_plugin, openai, setuptools). If we trust
+	# that file, pip later resolves transitives at *download time* against
+	# the host platform, and the resulting ./wheels/ dir is missing wheels
+	# (e.g. gevent for Linux) that Dify needs at install time.
+	#
+	# By running `uv lock` + `uv export --no-dev` against the target Python
+	# version and platform, we get a fully pinned, transitive requirements
+	# list (dify-plugin==0.7.2, gevent==25.5.1, greenlet==..., etc.) which
+	# `pip download` can then materialize wheel-by-wheel for the target.
+	if [ -f "pyproject.toml" ]; then
 		if command -v uv &> /dev/null; then
+			if [ -f "requirements.txt" ]; then
+				mv requirements.txt requirements.txt.original
+				echo "ℹ Found shipped requirements.txt; backed up as requirements.txt.original"
+				echo "  (regenerating with full transitive lock from pyproject.toml)"
+			fi
+
 			echo "Generating uv.lock file..."
 			uv lock ${UV_PLATFORM:+--python-platform ${UV_PLATFORM}} \
 				--python-version "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
@@ -347,7 +377,7 @@ PYSTRIP
 			fi
 			echo "✓ uv.lock generated successfully"
 
-			echo "Exporting requirements.txt from uv.lock..."
+			echo "Exporting requirements.txt from uv.lock (no-dev, fully pinned)..."
 			uv export --format requirements-txt -o requirements.txt --no-dev \
 				${UV_PLATFORM:+--python-platform ${UV_PLATFORM}} \
 				--python-version "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
@@ -359,11 +389,10 @@ PYSTRIP
 		else
 			echo "✗ Error: pyproject.toml found but uv is not installed"
 			echo "  Please install uv: pip install uv"
-			echo "  Or commit requirements.txt with the plugin"
 			exit 1
 		fi
 	elif [ -f "requirements.txt" ]; then
-		echo "✓ Using existing requirements.txt"
+		echo "✓ Using existing requirements.txt (no pyproject.toml found)"
 	fi
 
 	[ ! -f "requirements.txt" ] && echo "✗ Error: requirements.txt not found" && exit 1
@@ -380,16 +409,98 @@ PYSTRIP
 
 	mkdir -p ./wheels
 	echo "Downloading wheels to ./wheels/..."
-	${PIP_CMD} download ${PIP_PLATFORM} --prefer-binary -r requirements.txt -d ./wheels \
+
+	# When --platform is specified, pip requires --python-version too,
+	# otherwise it defaults to the host's interpreter and may pick wheels
+	# with the wrong ABI tag (e.g. cp313 instead of cp312).
+	PIP_PY_VERSION_FLAG=""
+	if [[ -n "$PIP_PLATFORM" ]]; then
+		PIP_PY_VERSION_FLAG="--python-version ${PIP_TARGET_PY_VERSION}"
+		echo "Target: platform=${RAW_PLATFORM}, python=${PIP_TARGET_PY_VERSION}"
+	fi
+
+	${PIP_CMD} download ${PIP_PLATFORM} ${PIP_PY_VERSION_FLAG} -r requirements.txt -d ./wheels \
 		--index-url ${PIP_MIRROR_URL} --trusted-host mirrors.aliyun.com
 	if [[ $? -ne 0 ]]; then
 		echo "✗ Error: Failed to download dependencies"
+		echo "  Hint: a transitive dep may not publish wheels for"
+		echo "        ${RAW_PLATFORM} / Python ${PIP_TARGET_PY_VERSION}."
+		echo "        Try a different -p value or pin a different version"
+		echo "        of the offending package in pyproject.toml."
 		exit 1
 	fi
 
 	# Count downloaded wheels
 	WHEEL_COUNT=$(ls -1 ./wheels/*.whl 2>/dev/null | wc -l)
 	echo "✓ Downloaded $WHEEL_COUNT wheel packages"
+
+	# ============================================
+	# Step 3.5: Verify every requirements.txt entry has a wheel
+	# ============================================
+	# This is what makes the difference between "package builds" and
+	# "Dify can actually install it". If a transitive dep has no wheel
+	# in ./wheels/, uv inside Dify fails with:
+	#   "depends on X==N.N.N, we can conclude that Y cannot be used."
+	echo ""
+	echo "Verifying wheel coverage against requirements.txt..."
+	MISSING_WHEELS=$(python3 - <<'PYVERIFY'
+import os, re, sys
+
+req_path = "requirements.txt"
+wheels_dir = "./wheels"
+
+if not os.path.isfile(req_path):
+    sys.exit(0)
+
+# pkg_name -> normalized form (PEP 503)
+def norm(n):
+    return re.sub(r"[-_.]+", "-", n).lower()
+
+# Parse requirements.txt: lines like "name==version ; marker" or "name==version"
+needed = {}
+with open(req_path, encoding="utf-8") as f:
+    for line in f:
+        line = line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        m = re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([A-Za-z0-9_.\-+!]+)", line)
+        if m:
+            needed[norm(m.group(1))] = m.group(2)
+
+# Inventory wheels: filenames like name-version-...whl
+present = set()
+if os.path.isdir(wheels_dir):
+    for fn in os.listdir(wheels_dir):
+        if not fn.endswith(".whl"):
+            continue
+        # split off the first two segments name-version
+        parts = fn.split("-")
+        if len(parts) >= 2:
+            present.add(norm(parts[0]))
+        # sdist fallback (.tar.gz) handled below
+
+    for fn in os.listdir(wheels_dir):
+        if fn.endswith(".tar.gz") or fn.endswith(".zip"):
+            base = fn.rsplit("-", 1)[0]
+            present.add(norm(base))
+
+missing = [n for n in needed if n not in present]
+for m in missing:
+    print(m)
+PYVERIFY
+)
+
+	if [[ -n "$MISSING_WHEELS" ]]; then
+		echo "✗ Error: the following packages are listed in requirements.txt"
+		echo "  but have no matching wheel in ./wheels/ for the target"
+		echo "  platform (${RAW_PLATFORM}, py${PIP_TARGET_PY_VERSION}):"
+		echo "$MISSING_WHEELS" | sed 's/^/    - /'
+		echo ""
+		echo "  Dify will fail to install this plugin. Aborting."
+		exit 1
+	fi
+	REQ_COUNT=$(grep -c -E '^[A-Za-z0-9_.\-]+\s*==' requirements.txt 2>/dev/null || echo "?")
+	echo "✓ All ${REQ_COUNT} pinned requirements.txt entries have matching wheels"
 
 	# ============================================
 	# Step 4: Update requirements.txt for offline usage
@@ -470,6 +581,25 @@ while getopts "p:s:R" opt; do
 		*) print_usage; exit 1 ;;
 	esac
 done
+
+# Dify's plugin runtime is ALWAYS Linux x86_64 + CPython 3.12.
+# If the user did not pass -p, force the wheel download to target that
+# platform tree. Otherwise, on a Windows/macOS/non-3.12 host, pip would grab
+# host-only wheels for transitive deps (e.g. gevent) and Dify could not
+# resolve them, producing errors like:
+#   "depends on gevent==25.5.1, we can conclude that dify-plugin==0.7.2
+#    cannot be used."
+if [[ -z "$RAW_PLATFORM" ]]; then
+	RAW_PLATFORM="manylinux2014_x86_64"
+	# Pass several --platform tags so pip accepts the broadest set of
+	# manylinux wheels that Dify's runtime can install.
+	PIP_PLATFORM="--platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux2_17_x86_64 --platform linux_x86_64 --only-binary=:all:"
+	echo "ℹ No -p given; defaulting target to Linux (manylinux2014_x86_64) for Dify"
+fi
+
+# Force the cross-target Python version to match Dify's runtime (3.12).
+# This is what pip uses to pick wheel ABI tags (cp312-...).
+PIP_TARGET_PY_VERSION="${PIP_TARGET_PY_VERSION:-3.12}"
 
 shift $((OPTIND - 1))
 
