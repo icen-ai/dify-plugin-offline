@@ -294,12 +294,6 @@ PY
 	echo "Step 2: Processing dependencies"
 	echo "=========================================="
 
-	# Inject [tool.uv] config to enable offline wheel usage
-	if [ -f "pyproject.toml" ]; then
-		echo "Found pyproject.toml, injecting [tool.uv] configuration..."
-		inject_uv_into_pyproject "pyproject.toml"
-	fi
-
 	# Strip dev dependency groups from pyproject.toml so that uv / plugin_daemon
 	# never attempts to resolve dev-only packages (black, pytest, ruff, etc.)
 	strip_dev_dependency_groups() {
@@ -345,6 +339,36 @@ PYSTRIP
 		echo "Stripping dev dependency groups from pyproject.toml..."
 		strip_dev_dependency_groups "pyproject.toml"
 		echo "✓ Dev dependency groups removed"
+
+# Force runtime deps to exact versions for Dify/plugin_daemon uv sync
+python3 - <<'PYFIXDEPS'
+from pathlib import Path
+import re
+
+p = Path("pyproject.toml")
+if p.exists():
+    text = p.read_text(encoding="utf-8")
+
+    new_deps = "dependencies = [\n" \
+        "    \"dify_plugin==0.7.4\",\n" \
+        "    \"gevent==25.5.1\",\n" \
+        "    \"greenlet==3.2.5\",\n" \
+        "    \"openai==2.32.0\",\n" \
+        "    \"setuptools==80.9.0\",\n" \
+        "]"
+
+    text, n = re.subn(
+        r'dependencies\s*=\s*\[(?:.|\n)*?\]',
+        new_deps,
+        text,
+        count=1
+    )
+
+    if n == 0:
+        raise SystemExit("未找到 dependencies = [...]，请检查 pyproject.toml 结构")
+
+    p.write_text(text, encoding="utf-8")
+PYFIXDEPS
 	fi
 
 	# IMPORTANT: We must ALWAYS regenerate requirements.txt from pyproject.toml
@@ -369,8 +393,7 @@ PYSTRIP
 			fi
 
 			echo "Generating uv.lock file..."
-			uv lock ${UV_PLATFORM:+--python-platform ${UV_PLATFORM}} \
-				--python-version "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
+			uv lock --python "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
 			if [[ $? -ne 0 ]]; then
 				echo "✗ Error: uv lock failed"
 				exit 1
@@ -379,13 +402,29 @@ PYSTRIP
 
 			echo "Exporting requirements.txt from uv.lock (no-dev, fully pinned)..."
 			uv export --format requirements-txt -o requirements.txt --no-dev \
-				${UV_PLATFORM:+--python-platform ${UV_PLATFORM}} \
-				--python-version "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
+				--python "${UV_PY_VERSION}" ${UV_PRERELEASE_FLAG}
 			if [[ $? -ne 0 ]]; then
 				echo "✗ Error: uv export failed"
 				exit 1
 			fi
 			echo "✓ requirements.txt generated successfully"
+python3 - <<'PYFIX'
+from pathlib import Path
+import re
+
+p = Path("requirements.txt")
+text = p.read_text(encoding="utf-8")
+
+# 1) 把 greenlet 错锁版本修正成可用版本
+text = text.replace("greenlet==3.4.0", "greenlet==3.2.5")
+
+# 2) 删除所有 uv 导出的 hash continuation 行，否则改版本后哈希一定不匹配
+text = re.sub(r' \\\n(?:\s*--hash=[^\n]+\n)+', '\n', text)
+
+p.write_text(text, encoding="utf-8")
+PYFIX
+sed -i 's/greenlet==3.4.0/greenlet==3.2.5/g' requirements.txt
+grep -q "greenlet==" requirements.txt || echo "greenlet==3.2.5" >> requirements.txt
 		else
 			echo "✗ Error: pyproject.toml found but uv is not installed"
 			echo "  Please install uv: pip install uv"
@@ -410,8 +449,8 @@ PYSTRIP
 	mkdir -p ./wheels
 	echo "Downloading wheels to ./wheels/..."
 
-	# When --platform is specified, pip requires --python-version too,
-	# otherwise it defaults to the host's interpreter and may pick wheels
+	# When --platform is specified, pip requires --python-version,
+	# otherwise it defaults to the host interpreter and may pick wheels
 	# with the wrong ABI tag (e.g. cp313 instead of cp312).
 	PIP_PY_VERSION_FLAG=""
 	if [[ -n "$PIP_PLATFORM" ]]; then
@@ -433,6 +472,27 @@ PYSTRIP
 	# Count downloaded wheels
 	WHEEL_COUNT=$(ls -1 ./wheels/*.whl 2>/dev/null | wc -l)
 	echo "✓ Downloaded $WHEEL_COUNT wheel packages"
+
+	# Work around plugin_daemon uv 0.9.26 offline resolution of conditional deps.
+	# Even Linux-irrelevant marker deps (e.g. gevent -> cffi on win32) may need
+	# local candidates present, otherwise uv marks gevent unusable.
+	echo "Downloading fallback marker-only dependencies for plugin_daemon uv..."
+	${PIP_CMD} download ${PIP_PLATFORM} ${PIP_PY_VERSION_FLAG} -d ./wheels \
+		cffi==1.17.1 pycparser==2.22 colorama==0.4.6 \
+		--index-url ${PIP_MIRROR_URL} --trusted-host mirrors.aliyun.com
+	if [[ $? -ne 0 ]]; then
+		echo "✗ Error: Failed to download fallback marker dependencies"
+		exit 1
+	fi
+	echo "✓ Fallback marker dependencies downloaded"
+
+	# Now that wheels exist, inject offline [tool.uv] config for runtime use
+	if [ -f "pyproject.toml" ]; then
+		echo ""
+		echo "Injecting offline [tool.uv] configuration for packaged runtime..."
+		inject_uv_into_pyproject "pyproject.toml"
+		echo "✓ Offline [tool.uv] configuration injected"
+	fi
 
 	# ============================================
 	# Step 3.5: Verify every requirements.txt entry has a wheel
@@ -463,6 +523,10 @@ with open(req_path, encoding="utf-8") as f:
         line = line.split("#", 1)[0].strip()
         if not line or line.startswith("-"):
             continue
+        # Skip requirements that are only needed on Windows
+        if 'sys_platform == "win32"' in line or "sys_platform == 'win32'" in line:
+            continue
+
         m = re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([A-Za-z0-9_.\-+!]+)", line)
         if m:
             needed[norm(m.group(1))] = m.group(2)
